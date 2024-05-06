@@ -1,4 +1,5 @@
 import io
+import math
 import os
 import re
 import tempfile
@@ -89,21 +90,37 @@ def get_remote_address():
     return ip
 
 
-def get_req_limits(default_limit, api_keys_db, multiplier=1):
+def get_req_limits(default_limit, api_keys_db, db_multiplier=1, multiplier=1):
     req_limit = default_limit
 
     if api_keys_db:
         api_key = get_req_api_key()
 
         if api_key:
-            db_req_limit = api_keys_db.lookup(api_key)
-            if db_req_limit is not None:
-                req_limit = db_req_limit * multiplier
+            api_key_limits = api_keys_db.lookup(api_key)
+            if api_key_limits is not None:
+                req_limit = api_key_limits[0] * db_multiplier
 
-    return req_limit
+    return int(req_limit * multiplier)
 
 
-def get_routes_limits(default_req_limit, hourly_req_limit, daily_req_limit, api_keys_db):
+def get_char_limit(default_limit, api_keys_db):
+    char_limit = default_limit
+
+    if api_keys_db:
+        api_key = get_req_api_key()
+
+        if api_key:
+            api_key_limits = api_keys_db.lookup(api_key)
+            if api_key_limits is not None:
+                if api_key_limits[1] is not None:
+                    char_limit = api_key_limits[1]
+
+    return char_limit
+
+
+def get_routes_limits(args, api_keys_db):
+    default_req_limit = args.req_limit
     if default_req_limit == -1:
         # TODO: better way?
         default_req_limit = 9999999999999
@@ -111,18 +128,22 @@ def get_routes_limits(default_req_limit, hourly_req_limit, daily_req_limit, api_
     def minute_limits():
         return "%s per minute" % get_req_limits(default_req_limit, api_keys_db)
 
-    def hourly_limits():
-        return "%s per hour" % get_req_limits(hourly_req_limit, api_keys_db, int(os.environ.get("LT_HOURLY_REQ_LIMIT_MULTIPLIER", 60)))
+    def hourly_limits(n):
+        def func():
+          decay = (0.75 ** (n - 1))
+          return "{} per {} hour".format(get_req_limits(args.hourly_req_limit * n, api_keys_db, int(os.environ.get("LT_HOURLY_REQ_LIMIT_MULTIPLIER", 60) * n), decay), n)
+        return func
 
     def daily_limits():
-        return "%s per day" % get_req_limits(daily_req_limit, api_keys_db, int(os.environ.get("LT_DAILY_REQ_LIMIT_MULTIPLIER", 1440)))
+        return "%s per day" % get_req_limits(args.daily_req_limit, api_keys_db, int(os.environ.get("LT_DAILY_REQ_LIMIT_MULTIPLIER", 1440)))
 
     res = [minute_limits]
 
-    if hourly_req_limit > 0:
-      res.append(hourly_limits)
+    if args.hourly_req_limit > 0:
+      for n in range(1, args.hourly_req_limit_decay + 2):
+        res.append(hourly_limits(n))
 
-    if daily_req_limit > 0:
+    if args.daily_req_limit > 0:
         res.append(daily_limits)
 
     return res
@@ -199,14 +220,21 @@ def create_app(args):
 
         from flask_limiter import Limiter
 
+        def limits_cost():
+          req_cost = getattr(request, 'req_cost', 1)
+          if args.req_time_cost > 0:
+            return max(req_cost, int(math.ceil(getattr(request, 'duration', 0) / args.req_time_cost)))
+          else:
+            return req_cost
+
         limiter = Limiter(
             key_func=get_remote_address,
             default_limits=get_routes_limits(
-                args.req_limit, args.hourly_req_limit, args.daily_req_limit, api_keys_db
+                args, api_keys_db
             ),
             storage_uri=args.req_limit_storage,
             default_limits_deduct_when=lambda req: True, # Force cost to be called after the request
-            default_limits_cost=lambda: getattr(request, 'req_cost', 1)
+            default_limits_cost=limits_cost
         )
     else:
         from .no_limiter import Limiter
@@ -305,12 +333,19 @@ def create_app(args):
                 status = e.code
                 raise e
               finally:
-                duration = max(default_timer() - start_t, 0)
-                measure_request.labels(request.path, status, ip, ak).observe(duration)
+                request.duration = max(default_timer() - start_t, 0)
+                measure_request.labels(request.path, status, ip, ak).observe(request.duration)
                 g.dec()
           return measure_func
         else:
-          return func
+          @wraps(func)
+          def time_func(*a, **kw):
+            start_t = default_timer()
+            try:
+              return func(*a, **kw)
+            finally:
+              request.duration = max(default_timer() - start_t, 0)
+          return time_func
 
     @bp.errorhandler(400)
     def invalid_api(e):
@@ -542,6 +577,8 @@ def create_app(args):
             # https://www.rfc-editor.org/rfc/rfc2046#section-4.1.1
             q = "\n".join(q.splitlines())
 
+        char_limit = get_char_limit(args.char_limit, api_keys_db)
+
         batch = isinstance(q, list)
 
         if batch and args.batch_limit != -1:
@@ -554,12 +591,12 @@ def create_app(args):
 
         src_texts = q if batch else [q]
 
-        if args.char_limit != -1:
+        if char_limit != -1:
             for text in src_texts:
-                if len(text) > args.char_limit:
+                if len(text) > char_limit:
                     abort(
                         400,
-                        description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=len(text), limit=args.char_limit),
+                        description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=len(text), limit=char_limit),
                     )
 
         if batch:
@@ -731,6 +768,7 @@ def create_app(args):
         source_lang = request.form.get("source")
         target_lang = request.form.get("target")
         file = request.files['file']
+        char_limit = get_char_limit(args.char_limit, api_keys_db)
 
         if not file:
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='file'))
@@ -766,8 +804,8 @@ def create_app(args):
             # set the cost of the request to N = bytes / char_limit, which is
             # roughly equivalent to a batch process of N batches assuming
             # each batch uses all available limits
-            if args.char_limit > 0:
-                request.req_cost = max(1, int(os.path.getsize(filepath) / args.char_limit))
+            if char_limit > 0:
+                request.req_cost = max(1, int(os.path.getsize(filepath) / char_limit))
 
             translated_file_path = argostranslatefiles.translate_file(src_lang.get_translation(tgt_lang), filepath)
             translated_filename = os.path.basename(translated_file_path)
@@ -820,7 +858,7 @@ def create_app(args):
             name: q
             schema:
               type: string
-              example: Hello world!
+              example: What language is this?
             required: true
             description: Text to detect
           - in: formData
@@ -841,11 +879,11 @@ def create_app(args):
                 properties:
                   confidence:
                     type: number
-                    format: float
+                    format: integer
                     minimum: 0
-                    maximum: 1
+                    maximum: 100
                     description: Confidence value
-                    example: 0.6
+                    example: 100
                   language:
                     type: string
                     description: Language code
